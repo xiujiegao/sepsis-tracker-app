@@ -249,14 +249,38 @@ if search_mode == "🧩 引导式拼接模式 (原生防呆)":
     def build_smart_query():
         parts = []
         if "PubMed" in db_choice:
-            if title_kw: parts.append(f"({title_kw})[Title]")
-            if mesh_kw: parts.append(f'("{mesh_kw}"[Mesh])')
-            if abs_kw: parts.append(f"({abs_kw})[Title/Abstract]")
+            if title_kw:
+                # 智能微操：自动把 [Title] 挂载到每一个双引号内的词汇上
+                if '"' in title_kw:
+                    t_kw = re.sub(r'\"([^\"]+)\"', r'"\1"[Title]', title_kw)
+                    parts.append(f"({t_kw})")
+                else:
+                    parts.append(f"({title_kw})[Title]")
+            if mesh_kw: 
+                parts.append(f'("{mesh_kw}"[Mesh])')
+            if abs_kw:
+                if '"' in abs_kw:
+                    a_kw = re.sub(r'\"([^\"]+)\"', r'"\1"[Title/Abstract]', abs_kw)
+                    parts.append(f"({a_kw})")
+                else:
+                    parts.append(f"({abs_kw})[Title/Abstract]")
         elif "Europe" in db_choice:
-            if title_kw: parts.append(f'TITLE:({title_kw})')
-            if mesh_kw: parts.append(f'({mesh_kw})')
-            if abs_kw: parts.append(f'({abs_kw})')
+            if title_kw:
+                if '"' in title_kw:
+                    t_kw = re.sub(r'\"([^\"]+)\"', r'TITLE:"\1"', title_kw)
+                    parts.append(f"({t_kw})")
+                else:
+                    parts.append(f'TITLE:({title_kw})')
+            if mesh_kw: 
+                parts.append(f'({mesh_kw})')
+            if abs_kw:
+                if '"' in abs_kw:
+                    a_kw = re.sub(r'\"([^\"]+)\"', r'ABSTRACT:"\1"', abs_kw)
+                    parts.append(f"({a_kw})")
+                else:
+                    parts.append(f'ABSTRACT:({abs_kw})')
         else:
+            # Semantic Scholar 保持原生，不加任何干扰标签
             if title_kw: parts.append(f"{title_kw}")
             if abs_kw: parts.append(f"{abs_kw}")
         return " AND ".join(parts)
