@@ -5,14 +5,14 @@ import google.generativeai as genai
 import datetime
 import time
 import pandas as pd
-import re  # 新增：用于清洗 Semantic Scholar 的符号
+import re
 
 # ==========================================
 # 1. 页面配置与状态初始化
 # ==========================================
 st.set_page_config(page_title="Pro Literature Tracker", layout="wide")
 st.title("🩸 Pro Pathogen RNA Tracker")
-st.markdown("三引擎适配 + 深度摘要全译解析 + 自动导出 🚀")
+st.markdown("原生检索指令直通车 + 深度摘要全译解析 + 自动导出 🚀")
 
 if 'search_results' not in st.session_state:
     st.session_state.search_results = []
@@ -22,36 +22,7 @@ if 'cn_summaries' not in st.session_state:
     st.session_state.cn_summaries = {}
 
 # ==========================================
-# 🔒 团队内部防盗门 (防止外人消耗 API 费用)
-# ==========================================
-def check_password():
-    """验证团队密码是否正确"""
-    def password_entered():
-        # 这里的 "StarArray2026" 就是你们团队的专属密码，你可以随便改
-        if st.session_state["password"] == "StarArray2026":
-            st.session_state["password_correct"] = True
-            del st.session_state["password"]  # 验证通过后销毁记录，保护安全
-        else:
-            st.session_state["password_correct"] = False
-
-    if "password_correct" not in st.session_state:
-        st.warning("🔒 这是一个团队内部科研项目。请输入访问密码以解锁 AI 引擎。")
-        st.text_input("🔑 团队密码", type="password", on_change=password_entered, key="password")
-        return False
-    elif not st.session_state["password_correct"]:
-        st.text_input("🔑 团队密码", type="password", on_change=password_entered, key="password")
-        st.error("❌ 密码错误，请联系项目负责人获取。")
-        return False
-    return True
-
-# 如果密码不对，直接拦截，下面的所有代码绝对不运行！
-if not check_password():
-    st.stop()
-    
-# 提示：如果密码正确，网页会正常加载下面的所有内容
-
-# ==========================================
-# 2. LLM 提示词 (🚨 全新升级的精读翻译 Prompt)
+# 2. LLM 提示词 (精读翻译 Prompt)
 # ==========================================
 SYSTEM_PROMPT = """
 You are a top-tier molecular biology literature analysis engine.
@@ -70,7 +41,6 @@ Strictly return a valid JSON object. Do not include markdown formatting. If a de
 }
 """
 
-# 将以前的“2-3句话摘要”升级为“完整翻译+核心提炼”
 CN_SUMMARY_PROMPT = """
 请作为专业的分子生物学科研助手，对以下这篇英文摘要进行全面且深度的中文解析。
 请严格包含以下两部分内容，并使用 Markdown 排版：
@@ -86,7 +56,7 @@ CN_SUMMARY_PROMPT = """
 """
 
 # ==========================================
-# 3. 数据库引擎模块 (🚨 修复 Semantic Scholar 语义识别)
+# 3. 数据库引擎模块 
 # ==========================================
 def search_pubmed(query, years_back, max_results):
     current_year = datetime.datetime.now().year
@@ -148,14 +118,12 @@ def search_semantic_scholar(query, years_back, max_results):
     mindate = current_year - years_back
     url = "https://api.semanticscholar.org/graph/v1/paper/search"
     
-    # 【核心修复】：为 AI 引擎卸下沉重的逻辑符号装甲，只保留干净的关键词
-    clean_query = re.sub(r'[\(\)\[\]\"]', '', query) # 删掉括号和引号
-    clean_query = clean_query.replace(' OR ', ' ').replace(' AND ', ' ').replace('NOT ', ' ') # 删掉布尔词
-    clean_query = re.sub(r'\s+', ' ', clean_query).strip() # 合并多余空格
+    clean_query = re.sub(r'\[.*?\]', '', query)
+    clean_query = re.sub(r'[\(\)\"TITLE:ABSTRACT:]', ' ', clean_query)
+    clean_query = clean_query.replace(' OR ', ' ').replace(' AND ', ' ').replace(' NOT ', ' ')
+    clean_query = re.sub(r'\s+', ' ', clean_query).strip()
     
-    # Semantic Scholar 官方要求 query 尽量不要超过 100 字符
-    if len(clean_query) > 100:
-        clean_query = clean_query[:100]
+    if len(clean_query) > 100: clean_query = clean_query[:100]
         
     params = {
         "query": clean_query,
@@ -171,8 +139,7 @@ def search_semantic_scholar(query, years_back, max_results):
         
         papers = []
         for item in results:
-            if not item.get("abstract"): continue # 过滤掉没有摘要的占位符文章
-            
+            if not item.get("abstract"): continue 
             p_id = item.get("paperId", "Unknown")
             ext_ids = item.get("externalIds", {})
             
@@ -199,23 +166,21 @@ def fetch_pubmed_abstract(pmid):
     return requests.get(fetch_url, params=fetch_params).text
 
 # ==========================================
-# 4. AI 分析模块 (Gemini 2.5 Pro)
+# 4. AI 分析模块 (Gemini 2.5 Pro) - 已修复截断问题
 # ==========================================
 def analyze_with_gemini_json(text, api_key):
     genai.configure(api_key=api_key)
     model = genai.GenerativeModel('gemini-2.5-pro')
     full_prompt = f"{SYSTEM_PROMPT}\n\nAbstract Text to Analyze:\n{text}"
-    
     for attempt in range(3):
         try:
             response = model.generate_content(full_prompt)
             clean_text = response.text.strip()
-            if clean_text.startswith("```json"): clean_text = clean_text[7:-3].strip()
-            elif clean_text.startswith("```"): clean_text = clean_text[3:-3].strip()
+            # 使用更安全的字符串替换方式，防止页面框架意外截断代码
+            clean_text = clean_text.replace("```json", "").replace("```", "").strip()
             return json.loads(clean_text)
         except Exception as e:
-            error_msg = str(e).lower()
-            if "429" in error_msg or "quota" in error_msg or "exhausted" in error_msg:
+            if "429" in str(e).lower() or "quota" in str(e).lower():
                 if attempt < 2:
                     time.sleep(3) 
                     continue
@@ -225,14 +190,11 @@ def generate_quick_cn_summary(text, api_key):
     genai.configure(api_key=api_key)
     model = genai.GenerativeModel('gemini-2.5-pro')
     full_prompt = f"{CN_SUMMARY_PROMPT}\n\nAbstract:\n{text}"
-    
     for attempt in range(3):
         try:
-            response = model.generate_content(full_prompt)
-            return response.text.strip()
+            return model.generate_content(full_prompt).text.strip()
         except Exception as e:
-            error_msg = str(e).lower()
-            if "429" in error_msg or "quota" in error_msg or "exhausted" in error_msg:
+            if "429" in str(e).lower() or "quota" in str(e).lower():
                 if attempt < 2:
                     time.sleep(3) 
                     continue
@@ -247,11 +209,8 @@ def convert_to_csv():
         p_id = paper['id']
         if p_id in st.session_state.ai_analyses or p_id in st.session_state.cn_summaries:
             row = {
-                "文献 ID": p_id,
-                "发表时间": paper['pubdate'],
-                "期刊/来源": paper['source'],
-                "文献标题": paper['title'],
-                "直达链接": paper['url'],
+                "文献 ID": p_id, "发表时间": paper['pubdate'], "期刊/来源": paper['source'],
+                "文献标题": paper['title'], "直达链接": paper['url'],
                 "🇨🇳 中文全译与解析": st.session_state.cn_summaries.get(p_id, "未生成")
             }
             ai_data = st.session_state.ai_analyses.get(p_id, {})
@@ -268,7 +227,7 @@ def convert_to_csv():
     return df.to_csv(index=False).encode('utf-8-sig')
 
 # ==========================================
-# 6. UI 与交互逻辑
+# 6. UI 与交互逻辑 (🌟 全新双模式检索架构)
 # ==========================================
 st.sidebar.header("⚙️ Configuration")
 api_key = st.sidebar.text_input("Enter Gemini API Key", type="password")
@@ -276,87 +235,67 @@ api_key = st.sidebar.text_input("Enter Gemini API Key", type="password")
 st.sidebar.header("🔍 Advanced Search Builder")
 db_choice = st.sidebar.radio(
     "📚 Select Database", 
-    [
-        "PubMed (Standard, highly precise)", 
-        "Europe PMC (Includes Preprints)", 
-        "Semantic Scholar (AI-driven, Broadest 🌟)"
-    ]
+    ["PubMed (Standard, highly precise)", "Europe PMC (Includes Preprints)", "Semantic Scholar (AI-driven, Broadest)"]
 )
 
-st.sidebar.markdown("**1. 核心定位 (精准打击)**")
-title_kw = st.sidebar.text_area("必须在【文章标题】中包含", value='("sepsis" OR "bloodstream infection") AND ("16S" OR "RNA")', height=80)
-mesh_kw = st.sidebar.text_input("医学主题词 MeSH (仅PubMed)", value="Sepsis")
+search_mode = st.sidebar.radio("🎯 检索模式", ["🧩 引导式拼接模式 (原生防呆)", "💻 专家原码模式 (100% 控制权)"])
 
-st.sidebar.markdown("**2. 实验要素 (摘要/全文提及即可)**")
-sample_kw = st.sidebar.text_area("【样本类型】包含", value='"whole blood" OR "blood"', height=60)
-tech_kw = st.sidebar.text_area("【检测技术/靶标】包含", value='("16S" OR "18S" OR "rRNA") AND "RT-qPCR"', height=80)
+if search_mode == "🧩 引导式拼接模式 (原生防呆)":
+    st.sidebar.markdown("<small>提示：支持输入括号和 AND/OR，系统将为您安全添加字段标签。</small>", unsafe_allow_html=True)
+    title_kw = st.sidebar.text_area("文章【标题】必须包含:", value='"sepsis" AND "RT-qPCR"', height=60)
+    mesh_kw = st.sidebar.text_input("医学主题词 MeSH (仅PubMed):", value="")
+    abs_kw = st.sidebar.text_area("文章【摘要/全文】必须包含:", value='"whole blood"', height=60)
+    
+    def build_smart_query():
+        parts = []
+        if "PubMed" in db_choice:
+            if title_kw: parts.append(f"({title_kw})[Title]")
+            if mesh_kw: parts.append(f'("{mesh_kw}"[Mesh])')
+            if abs_kw: parts.append(f"({abs_kw})[Title/Abstract]")
+        elif "Europe" in db_choice:
+            if title_kw: parts.append(f'TITLE:({title_kw})')
+            if mesh_kw: parts.append(f'({mesh_kw})')
+            if abs_kw: parts.append(f'({abs_kw})')
+        else:
+            if title_kw: parts.append(f"{title_kw}")
+            if abs_kw: parts.append(f"{abs_kw}")
+        return " AND ".join(parts)
+        
+    final_query = build_smart_query()
+
+else:
+    st.sidebar.markdown("<small>提示：直接输入完整的底层检索式，系统不做任何修改直接发送！</small>", unsafe_allow_html=True)
+    final_query = st.sidebar.text_area(
+        "📝 输入原生检索式:", 
+        value='("sepsis"[Title] OR "bloodstream infection"[Title]) AND ("RT-qPCR"[Title/Abstract]) AND ("whole blood"[Title/Abstract])', 
+        height=150
+    )
 
 years_back = st.sidebar.selectbox("Time Range", [1, 3, 5, 10], index=2, format_func=lambda x: f"Last {x} Years")
 max_results = st.sidebar.slider("Max papers to fetch", 10, 100, 50)
 
-# ==========================================
-# 🎯 动态拼接神级检索式 (全新 Regex 智能标签注入)
-# ==========================================
-def build_smart_query(db_type):
-    parts = []
-    if "PubMed" in db_type:
-        if title_kw: 
-            # 智能注入：把 "sepsis" 变成 "sepsis"[Title]
-            t_kw = re.sub(r'\"([^\"]+)\"', r'"\1"[Title]', title_kw)
-            parts.append(f"({t_kw})")
-        if mesh_kw: 
-            parts.append(f'("{mesh_kw}"[Mesh])')
-        if sample_kw: 
-            # 智能注入：把 "whole blood" 变成 "whole blood"[Title/Abstract]
-            s_kw = re.sub(r'\"([^\"]+)\"', r'"\1"[Title/Abstract]', sample_kw)
-            parts.append(f"({s_kw})")
-        if tech_kw: 
-            tc_kw = re.sub(r'\"([^\"]+)\"', r'"\1"[Title/Abstract]', tech_kw)
-            parts.append(f"({tc_kw})")
-            
-    elif "Europe" in db_type:
-        if title_kw: 
-            # EPMC 语法：把 "sepsis" 变成 TITLE:"sepsis"
-            t_kw = re.sub(r'\"([^\"]+)\"', r'TITLE:"\1"', title_kw)
-            parts.append(f"({t_kw})")
-        if mesh_kw: 
-            parts.append(f'("{mesh_kw}")')
-        if sample_kw: 
-            s_kw = re.sub(r'\"([^\"]+)\"', r'ABSTRACT:"\1"', sample_kw)
-            parts.append(f"({s_kw})")
-        if tech_kw: 
-            tc_kw = re.sub(r'\"([^\"]+)\"', r'ABSTRACT:"\1"', tech_kw)
-            parts.append(f"({tc_kw})")
-            
-    else:
-        # Semantic Scholar (它是 AI 模糊语义引擎，不支持严格字段框定)
-        if title_kw: parts.append(f"({title_kw})")
-        if sample_kw: parts.append(f"({sample_kw})")
-        if tech_kw: parts.append(f"({tech_kw})")
-        
-    return " AND ".join(parts)
-
-final_query = build_smart_query(db_choice)
-
-with st.sidebar.expander("👀 查看底层生成的 API 检索式", expanded=False):
+with st.sidebar.expander("👀 查看即将发送至服务器的真实代码", expanded=True):
     st.code(final_query, language="text")
 
 # ==========================================
 # 🚀 触发搜索与展示逻辑
 # ==========================================
 if st.sidebar.button("1. Fetch Summary List"):
-    with st.spinner(f"Searching {db_choice} with advanced filters..."):
-        if "PubMed" in db_choice:
-            st.session_state.search_results = search_pubmed(final_query, years_back, max_results)
-        elif "Europe" in db_choice:
-            st.session_state.search_results = search_epmc(final_query, years_back, max_results)
-        else:
-            st.session_state.search_results = search_semantic_scholar(final_query, years_back, max_results)
-            
-        if st.session_state.search_results:
-            st.sidebar.success(f"Found {len(st.session_state.search_results)} highly relevant papers!")
-        else:
-            st.sidebar.warning("No papers found. 可能是条件太苛刻了，试着去掉几个关键词！")
+    if not final_query.strip():
+        st.sidebar.error("检索式不能为空！")
+    else:
+        with st.spinner(f"Searching {db_choice} with advanced filters..."):
+            if "PubMed" in db_choice:
+                st.session_state.search_results = search_pubmed(final_query, years_back, max_results)
+            elif "Europe" in db_choice:
+                st.session_state.search_results = search_epmc(final_query, years_back, max_results)
+            else:
+                st.session_state.search_results = search_semantic_scholar(final_query, years_back, max_results)
+                
+            if st.session_state.search_results:
+                st.sidebar.success(f"Found {len(st.session_state.search_results)} highly relevant papers!")
+            else:
+                st.sidebar.warning("No papers found. 可能是条件太苛刻，请检查拼写或放宽条件！")
 
 # --- 导出按钮区 ---
 if st.session_state.ai_analyses or st.session_state.cn_summaries:
@@ -382,7 +321,6 @@ if st.session_state.search_results:
             col1, col2 = st.columns(2)
             with col1:
                 if p_id not in st.session_state.cn_summaries:
-                    # 按钮名称从“速览”升级为“深度翻译与解析”
                     if st.button("🇨🇳 深度翻译与核心提炼", key=f"cn_{p_id}"):
                         if not api_key: st.error("请在左侧输入 API Key。")
                         else:
