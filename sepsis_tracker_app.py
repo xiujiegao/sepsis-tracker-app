@@ -6,13 +6,21 @@ import datetime
 import time
 import pandas as pd
 import re
+import io
+
+# 尝试导入 PDF 解析库，并做友好提示
+try:
+    from pypdf import PdfReader
+    PYPDF_AVAILABLE = True
+except ImportError:
+    PYPDF_AVAILABLE = False
 
 # ==========================================
 # 1. 页面配置与状态初始化
 # ==========================================
 st.set_page_config(page_title="Pro Literature Tracker", layout="wide")
 st.title("🩸 Pro Pathogen RNA Tracker")
-st.markdown("原生检索指令直通车 + 深度摘要全译解析 + 自动导出 🚀")
+st.markdown("在线深度检索 + 本地 PDF 精读 + Sepsis 项目专属顾问 🚀")
 
 if 'search_results' not in st.session_state:
     st.session_state.search_results = []
@@ -20,9 +28,11 @@ if 'ai_analyses' not in st.session_state:
     st.session_state.ai_analyses = {}
 if 'cn_summaries' not in st.session_state:
     st.session_state.cn_summaries = {}
+if 'local_analysis' not in st.session_state:
+    st.session_state.local_analysis = None
 
 # ==========================================
-# 2. LLM 提示词 (精读翻译 Prompt)
+# 2. LLM 提示词 (新增专属项目顾问 Prompt)
 # ==========================================
 SYSTEM_PROMPT = """
 You are a top-tier molecular biology literature analysis engine.
@@ -53,6 +63,42 @@ CN_SUMMARY_PROMPT = """
 - **研究样本**：(说明具体样本类型，如全血、血清，及体积等，若无则写未提及)
 - **提取与检测方法**：(说明提取策略、试剂盒、核心扩增技术等)
 - **关键结果与参数**：(说明灵敏度 LOD、特异性、检测时间等具体数值)
+"""
+
+# 🌟 新增：专属 Sepsis 项目顾问 Prompt
+PROJECT_CONTEXT = """
+【我的 Sepsis 快速检测项目背景】：
+基于 10mL 全血样品，进行超灵敏度的、以每种菌特异性 16S rRNA 片段（包括真菌靶标）为靶标的超快速检测。
+我的核心三步法与痛点如下：
+1. **样本前处理**：10mL 全血的血细胞裂解与清洗。目标是获得不破碎的细菌，极力提高极低浓度下的细菌回收率。
+2. **核酸提取**：对清洗后的细菌采用“超声”物理方式进行核酸释放，获取 total DNA 和 RNA。
+3. **特异性检测**：设计各菌种 16S rRNA 特异性序列。建立高灵敏 RT-qPCR。最大痛点是必须避免/消除 16S 的试剂本底信号（NC 起线/假阳性污染）。
+"""
+
+LOCAL_PAPER_PROMPT = f"""
+请作为顶尖的分子诊断与微生物学专家，仔细阅读以下我提供的文献全文（或文本片段），并输出一份深度的中文评估报告。
+
+请严格按照以下 Markdown 格式输出：
+
+### 📝 【文献中文精粹】
+（提炼本文的主要研究目的、核心方法、最重要的数据结果和最终结论）
+
+### 🧪 【核心技术参数提取】
+- **样本处理**：（记录其处理的全血体积、裂解方式、富集方法等）
+- **核酸提取**：（提取试剂、物理/化学打断方式等）
+- **检测方法与靶标**：（PCR/RT-qPCR等，是否提供具体引物/探针序列信息，LOD 灵敏度等）
+
+### 💡 【对您 Sepsis 项目的深度对比与评估】
+已知您的项目背景如下：
+{PROJECT_CONTEXT}
+
+请结合这篇文献的内容，针对您的三个关键环节进行逐一对比、启发评估。如果文献中没有相关内容，请说明“本文未涉及”，并给出您作为顶尖专家的额外分析建议：
+1. **关于 10mL 全血裂解与细菌富集**：（文献的方法对比您的思路有何优劣？能否帮助您提高细菌回收率？）
+2. **关于超声释放核酸 (DNA/RNA)**：（文献的提取方式有何不同？您的超声方案有何潜在风险或优化空间？）
+3. **关于 16S 特异性扩增与本底消除**：（文献是如何解决背景污染/NC起线问题的？对您的特异性靶标设计有何借鉴？）
+
+### 🛠️ 【下一步实验优化建议】
+（基于您的痛点和这篇文献的启发，给出 2-3 条切实可行的实验操作改进建议）
 """
 
 # ==========================================
@@ -166,7 +212,7 @@ def fetch_pubmed_abstract(pmid):
     return requests.get(fetch_url, params=fetch_params).text
 
 # ==========================================
-# 4. AI 分析模块 (Gemini 2.5 Pro) - 已修复截断问题
+# 4. AI 分析模块 (Gemini 2.5 Pro) 
 # ==========================================
 def analyze_with_gemini_json(text, api_key):
     genai.configure(api_key=api_key)
@@ -176,7 +222,6 @@ def analyze_with_gemini_json(text, api_key):
         try:
             response = model.generate_content(full_prompt)
             clean_text = response.text.strip()
-            # 使用更安全的字符串替换方式，防止页面框架意外截断代码
             clean_text = clean_text.replace("```json", "").replace("```", "").strip()
             return json.loads(clean_text)
         except Exception as e:
@@ -190,6 +235,21 @@ def generate_quick_cn_summary(text, api_key):
     genai.configure(api_key=api_key)
     model = genai.GenerativeModel('gemini-2.5-pro')
     full_prompt = f"{CN_SUMMARY_PROMPT}\n\nAbstract:\n{text}"
+    for attempt in range(3):
+        try:
+            return model.generate_content(full_prompt).text.strip()
+        except Exception as e:
+            if "429" in str(e).lower() or "quota" in str(e).lower():
+                if attempt < 2:
+                    time.sleep(3) 
+                    continue
+            raise e
+
+def analyze_local_paper(text, api_key):
+    """专属的项目文献评估引擎"""
+    genai.configure(api_key=api_key)
+    model = genai.GenerativeModel('gemini-2.5-pro')
+    full_prompt = f"{LOCAL_PAPER_PROMPT}\n\n======================\n【提供的文献内容】：\n{text}"
     for attempt in range(3):
         try:
             return model.generate_content(full_prompt).text.strip()
@@ -226,8 +286,15 @@ def convert_to_csv():
     df = pd.DataFrame(export_data)
     return df.to_csv(index=False).encode('utf-8-sig')
 
+def extract_text_from_pdf(uploaded_file):
+    reader = PdfReader(uploaded_file)
+    text = ""
+    for page in reader.pages:
+        text += page.extract_text() + "\n"
+    return text
+
 # ==========================================
-# 6. UI 与交互逻辑 (🌟 全新双模式检索架构)
+# 6. UI 与交互逻辑
 # ==========================================
 st.sidebar.header("⚙️ Configuration")
 api_key = st.sidebar.text_input("Enter Gemini API Key", type="password")
@@ -250,14 +317,12 @@ if search_mode == "🧩 引导式拼接模式 (原生防呆)":
         parts = []
         if "PubMed" in db_choice:
             if title_kw:
-                # 智能微操：自动把 [Title] 挂载到每一个双引号内的词汇上
                 if '"' in title_kw:
                     t_kw = re.sub(r'\"([^\"]+)\"', r'"\1"[Title]', title_kw)
                     parts.append(f"({t_kw})")
                 else:
                     parts.append(f"({title_kw})[Title]")
-            if mesh_kw: 
-                parts.append(f'("{mesh_kw}"[Mesh])')
+            if mesh_kw: parts.append(f'("{mesh_kw}"[Mesh])')
             if abs_kw:
                 if '"' in abs_kw:
                     a_kw = re.sub(r'\"([^\"]+)\"', r'"\1"[Title/Abstract]', abs_kw)
@@ -271,8 +336,7 @@ if search_mode == "🧩 引导式拼接模式 (原生防呆)":
                     parts.append(f"({t_kw})")
                 else:
                     parts.append(f'TITLE:({title_kw})')
-            if mesh_kw: 
-                parts.append(f'({mesh_kw})')
+            if mesh_kw: parts.append(f'({mesh_kw})')
             if abs_kw:
                 if '"' in abs_kw:
                     a_kw = re.sub(r'\"([^\"]+)\"', r'ABSTRACT:"\1"', abs_kw)
@@ -280,7 +344,6 @@ if search_mode == "🧩 引导式拼接模式 (原生防呆)":
                 else:
                     parts.append(f'ABSTRACT:({abs_kw})')
         else:
-            # Semantic Scholar 保持原生，不加任何干扰标签
             if title_kw: parts.append(f"{title_kw}")
             if abs_kw: parts.append(f"{abs_kw}")
         return " AND ".join(parts)
@@ -301,92 +364,127 @@ max_results = st.sidebar.slider("Max papers to fetch", 10, 100, 50)
 with st.sidebar.expander("👀 查看即将发送至服务器的真实代码", expanded=True):
     st.code(final_query, language="text")
 
-# ==========================================
-# 🚀 触发搜索与展示逻辑
-# ==========================================
 if st.sidebar.button("1. Fetch Summary List"):
     if not final_query.strip():
         st.sidebar.error("检索式不能为空！")
     else:
         with st.spinner(f"Searching {db_choice} with advanced filters..."):
-            if "PubMed" in db_choice:
-                st.session_state.search_results = search_pubmed(final_query, years_back, max_results)
-            elif "Europe" in db_choice:
-                st.session_state.search_results = search_epmc(final_query, years_back, max_results)
-            else:
-                st.session_state.search_results = search_semantic_scholar(final_query, years_back, max_results)
+            if "PubMed" in db_choice: st.session_state.search_results = search_pubmed(final_query, years_back, max_results)
+            elif "Europe" in db_choice: st.session_state.search_results = search_epmc(final_query, years_back, max_results)
+            else: st.session_state.search_results = search_semantic_scholar(final_query, years_back, max_results)
                 
             if st.session_state.search_results:
                 st.sidebar.success(f"Found {len(st.session_state.search_results)} highly relevant papers!")
             else:
                 st.sidebar.warning("No papers found. 可能是条件太苛刻，请检查拼写或放宽条件！")
 
-# --- 导出按钮区 ---
+# 导出按钮区
 if st.session_state.ai_analyses or st.session_state.cn_summaries:
     st.sidebar.markdown("---")
     st.sidebar.header("💾 导出科研成果")
     csv_bytes = convert_to_csv()
     current_date = datetime.datetime.now().strftime("%Y-%m-%d")
-    st.sidebar.download_button(
-        label="📥 下载已分析数据 (Excel格式)",
-        data=csv_bytes, file_name=f"Pro_Analysis_Data_{current_date}.csv", mime="text/csv"
-    )
+    st.sidebar.download_button("📥 下载已分析数据 (Excel格式)", data=csv_bytes, file_name=f"Pro_Analysis_Data_{current_date}.csv", mime="text/csv")
 
-# --- 主界面展示区 ---
-if st.session_state.search_results:
-    st.subheader(f"📑 Search Results from {db_choice}")
-    st.caption("Sorted by publication date (Newest first). Click expander to view AI options.")
+# ==========================================
+# 🌟 主界面：双重 Tab 布局设计
+# ==========================================
+tab_search, tab_upload = st.tabs(["🌐 1. 在线文献检索与批量分析", "📂 2. 本地全文深度精读与专属 Sepsis 评估"])
+
+with tab_search:
+    if st.session_state.search_results:
+        st.subheader(f"📑 Search Results from {db_choice}")
+        st.caption("Sorted by publication date (Newest first). Click expander to view AI options.")
+        
+        for paper in st.session_state.search_results:
+            p_id = paper['id']
+            with st.expander(f"📅 {paper['pubdate']} | {paper['title']}"):
+                st.markdown(f"**Source:** *{paper['source']}* | [🔗 访问原文 (View Full Article)]({paper['url']})")
+                
+                col1, col2 = st.columns(2)
+                with col1:
+                    if p_id not in st.session_state.cn_summaries:
+                        if st.button("🇨🇳 深度翻译与核心提炼", key=f"cn_{p_id}"):
+                            if not api_key: st.error("请在左侧输入 API Key。")
+                            else:
+                                with st.spinner("Pro 大脑正在逐句精译并提炼核心数据..."):
+                                    try:
+                                        abstract = paper['abstract'] if paper['abstract'] else fetch_pubmed_abstract(p_id)
+                                        st.session_state.cn_summaries[p_id] = generate_quick_cn_summary(abstract, api_key)
+                                        st.rerun()
+                                    except Exception as e: st.error(f"❌ API 请求失败 ({str(e)})")
+                    else:
+                        st.success(f"💡 **中文精读报告**：\n{st.session_state.cn_summaries[p_id]}")
+
+                with col2:
+                    if p_id not in st.session_state.ai_analyses:
+                        if st.button("🔬 生成深度结构化解析 (JSON)", key=f"deep_{p_id}"):
+                            if not api_key: st.error("请在左侧输入 API Key。")
+                            else:
+                                with st.spinner("Pro 大脑正在提取实验参数..."):
+                                    try:
+                                        abstract = paper['abstract'] if paper['abstract'] else fetch_pubmed_abstract(p_id)
+                                        res = analyze_with_gemini_json(abstract, api_key)
+                                        res['abstract_text'] = abstract
+                                        st.session_state.ai_analyses[p_id] = res
+                                        st.rerun()
+                                    except Exception as e: st.error(f"❌ API 请求失败 ({str(e)})")
+                                
+                if p_id in st.session_state.ai_analyses:
+                    res = st.session_state.ai_analyses[p_id]
+                    st.divider()
+                    t1, t2, t3, t4 = st.tabs(["🎯 目的与病原体", "🧪 方法与制备", "📊 结果与局限", "📝 原文摘要"])
+                    with t1:
+                        st.markdown(f"**Research Purpose:** {res.get('research_purpose')}")
+                        st.markdown(f"**Target Pathogens:** {res.get('target_pathogens')}")
+                    with t2:
+                        st.markdown(f"**Sample Type:** {res.get('sample_type')}")
+                        st.markdown(f"**Sample Prep & Extraction:** {res.get('sample_prep_and_extraction')}")
+                        st.markdown(f"**Experimental Methods:** {res.get('experimental_methods')}")
+                        st.markdown(f"**Primer/Probe Sequences:** {res.get('primer_probe_sequences')}")
+                    with t3:
+                        st.markdown(f"**Main Results:** {res.get('main_results')}")
+                        st.markdown(f"**Limitations:** {res.get('limitations')}")
+                    with t4:
+                        st.write(res.get('abstract_text'))
+    else:
+        st.info("👈 设置侧边栏条件并点击 'Fetch Summary List' 开始检索在线数据库。")
+
+# --- 🌟 新增：本地文献解析专区 ---
+with tab_upload:
+    st.markdown("### 📄 上传文献进行全文深度评估")
+    st.info("💡 **专家提示**：Gemini 2.5 Pro 支持高达 100万 Token 的超长上下文。您可以直接上传几页甚至几十页的 PDF 全文，AI 将结合您专属的 10mL 全血超声提取与 16S 靶标项目进行深度对比评估。")
     
-    for paper in st.session_state.search_results:
-        p_id = paper['id']
-        with st.expander(f"📅 {paper['pubdate']} | {paper['title']}"):
-            st.markdown(f"**Source:** *{paper['source']}* | [🔗 访问原文 (View Full Article)]({paper['url']})")
-            
-            col1, col2 = st.columns(2)
-            with col1:
-                if p_id not in st.session_state.cn_summaries:
-                    if st.button("🇨🇳 深度翻译与核心提炼", key=f"cn_{p_id}"):
-                        if not api_key: st.error("请在左侧输入 API Key。")
-                        else:
-                            with st.spinner("Pro 大脑正在逐句精译并提炼核心数据..."):
-                                try:
-                                    abstract = paper['abstract'] if paper['abstract'] else fetch_pubmed_abstract(p_id)
-                                    st.session_state.cn_summaries[p_id] = generate_quick_cn_summary(abstract, api_key)
-                                    st.rerun()
-                                except Exception as e: st.error(f"❌ API 请求失败 ({str(e)})")
+    if not PYPDF_AVAILABLE:
+        st.error("🚨 缺少 PDF 解析插件！请在终端运行 `pip install pypdf` 或将其加入您的 GitHub requirements.txt 中。")
+    else:
+        uploaded_file = st.file_uploader("📂 请上传一篇文献全文 (仅支持 .pdf 或 .txt)", type=['pdf', 'txt'])
+        
+        if uploaded_file is not None:
+            if st.button("🔬 针对我的 Sepsis 项目进行深度诊断评估", type="primary"):
+                if not api_key:
+                    st.error("请先在左侧侧边栏输入您的 API Key。")
                 else:
-                    st.success(f"💡 **中文精读报告**：\n{st.session_state.cn_summaries[p_id]}")
-
-            with col2:
-                if p_id not in st.session_state.ai_analyses:
-                    if st.button("🔬 生成深度结构化解析 (JSON)", key=f"deep_{p_id}"):
-                        if not api_key: st.error("请在左侧输入 API Key。")
-                        else:
-                            with st.spinner("Pro 大脑正在提取实验参数..."):
-                                try:
-                                    abstract = paper['abstract'] if paper['abstract'] else fetch_pubmed_abstract(p_id)
-                                    res = analyze_with_gemini_json(abstract, api_key)
-                                    res['abstract_text'] = abstract
-                                    st.session_state.ai_analyses[p_id] = res
-                                    st.rerun()
-                                except Exception as e: st.error(f"❌ API 请求失败 ({str(e)})")
+                    with st.spinner("🧠 正在阅读全文，并结合您的 3步法痛点进行对比思考，请稍候..."):
+                        try:
+                            # 提取文本
+                            if uploaded_file.name.endswith('.pdf'):
+                                paper_text = extract_text_from_pdf(uploaded_file)
+                            else:
+                                paper_text = uploaded_file.getvalue().decode('utf-8')
                             
-            if p_id in st.session_state.ai_analyses:
-                res = st.session_state.ai_analyses[p_id]
-                st.divider()
-                tab1, tab2, tab3, tab4 = st.tabs(["🎯 目的与病原体", "🧪 方法与制备", "📊 结果与局限", "📝 原文摘要"])
-                with tab1:
-                    st.markdown(f"**Research Purpose:** {res.get('research_purpose')}")
-                    st.markdown(f"**Target Pathogens:** {res.get('target_pathogens')}")
-                with tab2:
-                    st.markdown(f"**Sample Type:** {res.get('sample_type')}")
-                    st.markdown(f"**Sample Prep & Extraction:** {res.get('sample_prep_and_extraction')}")
-                    st.markdown(f"**Experimental Methods:** {res.get('experimental_methods')}")
-                    st.markdown(f"**Primer/Probe Sequences:** {res.get('primer_probe_sequences')}")
-                with tab3:
-                    st.markdown(f"**Main Results:** {res.get('main_results')}")
-                    st.markdown(f"**Limitations:** {res.get('limitations')}")
-                with tab4:
-                    st.write(res.get('abstract_text'))
-else:
-    st.info("👈 设置侧边栏条件并点击 'Fetch Summary List' 开始检索。")
+                            # 限制一下字数防止恶意超大文件，通常一篇论文 < 100,000 字符
+                            if len(paper_text) > 300000:
+                                st.warning("文献过长，已截取前 300,000 字进行解析。")
+                                paper_text = paper_text[:300000]
+                            
+                            # 调用 AI 顾问引擎
+                            st.session_state.local_analysis = analyze_local_paper(paper_text, api_key)
+                            
+                        except Exception as e:
+                            st.error(f"❌ 解析失败，请检查文件格式或 API 状态：{e}")
+                            
+            # 展示分析结果
+            if st.session_state.local_analysis:
+                st.success("✅ 解析完成！以下是为您量身定制的诊断评估报告：")
+                st.markdown(st.session_state.local_analysis)
